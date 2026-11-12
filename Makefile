@@ -4,9 +4,15 @@
 # The native path is the supported fallback and must always work.
 
 VENV    ?= .venv
-PY      ?= $(VENV)/bin/python
-PIP     ?= $(VENV)/bin/pip
-PYTEST  ?= $(VENV)/bin/pytest
+# Windows venvs put executables in Scripts/, POSIX ones in bin/.
+ifeq ($(OS),Windows_NT)
+VENV_BIN ?= $(VENV)/Scripts
+else
+VENV_BIN ?= $(VENV)/bin
+endif
+PY      ?= $(VENV_BIN)/python
+PIP     ?= $(VENV_BIN)/pip
+PYTEST  ?= $(VENV_BIN)/pytest
 HOST    ?= 127.0.0.1
 PORT    ?= 8080
 MOCK_PORT ?= 8081
