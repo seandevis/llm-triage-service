@@ -26,18 +26,18 @@ The order is the lesson. From outside in:
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
 from app.config import Settings, get_settings
 from app.providers.base import Provider
 from app.reliability.breaker import CircuitBreaker, CircuitOpenError
 from app.reliability.idempotency import IdempotencyStore, build_redis, make_key
-from app.reliability.limits import Limits, SpendCeilingExceeded
-from app.reliability.retry import RetryPolicy, with_retry
+from app.reliability.limits import Limits
+from app.reliability.retry import RetryPolicy, with_retry, RetryExhaustedError
 from app.schema import StreamEvent, TriageResult
 
 
-def build_provider(settings: Settings) -> Provider:
+def build_provider(settings: Settings, name: str | None = None) -> Provider | None:
     """The one place a dialect name becomes a concrete adapter.
 
     Imports are local so a process imports only the SDK of the dialect it is
@@ -48,14 +48,14 @@ def build_provider(settings: Settings) -> Provider:
     this function. Everything from the semaphore upward is written against the
     Provider Protocol, so adding a dialect costs one adapter and one line here.
     """
-    if settings.provider == "openai":
+    dialect = name if name is not None else settings.provider
+    if dialect == "openai":
         from app.providers.openai_p import OpenAIProvider
-
         return OpenAIProvider(settings)
-    from app.providers.anthropic_p import AnthropicProvider
-
-    return AnthropicProvider(settings)
-
+    elif dialect == "anthropic":
+        from app.providers.anthropic_p import AnthropicProvider
+        return AnthropicProvider(settings)
+    return None
 
 class TriageService:
     """Holds the provider and the reliability layers for the process."""
@@ -64,16 +64,22 @@ class TriageService:
         self,
         *,
         provider: Provider | None = None,
+        fallback: Provider | None = None,
         settings: Settings | None = None,
         store: IdempotencyStore | None = None,
         limits: Limits | None = None,
         breaker: CircuitBreaker | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.provider = provider or build_provider(self.settings)
+        primary = provider or build_provider(self.settings)
+        if primary is None:
+            raise RuntimeError(f"no provider adapter for dialect {self.settings.provider!r}")
+        self.provider: Provider = primary
+        self.fallback = fallback or build_provider(self.settings, self.settings.fallback)
         self.store = store or IdempotencyStore(build_redis(self.settings))
         self.limits = limits or Limits.from_settings(self.settings)
         self.breaker = breaker or CircuitBreaker(name="anthropic")
+        self.fallback_breaker = CircuitBreaker(name="openai") if self.fallback else None
         self.policy = RetryPolicy(max_retries=self.settings.max_retries)
         # Salts the cache key with the settings that change the answer, so a
         # run at a different temperature or model does not serve the previous
@@ -93,9 +99,7 @@ class TriageService:
             key, lambda: self._attempt_with_limits(text, idem_key)
         )
 
-    async def _attempt_with_limits(self, text: str, idem_key: str | None) -> TriageResult:
-        """One logical request: budget, breaker+retry, semaphore, upstream."""
-
+    async def _run_provider(self, provider, breaker, text, idem_key) -> TriageResult:
         async def one_attempt() -> TriageResult:
             # Reserve worst-case budget BEFORE the call. Raises rather than
             # reporting an overrun after the fact.
@@ -104,7 +108,7 @@ class TriageService:
             try:
                 async with self.limits.limiter():
                     await self._rate_slot()
-                    result, in_tok, out_tok = await self.provider.extract_with_usage(
+                    result, in_tok, out_tok = await provider.extract_with_usage(
                         text, idem_key=idem_key
                     )
                 await self.limits.ledger.settle(reserved, in_tok, out_tok)
@@ -113,8 +117,15 @@ class TriageService:
             finally:
                 if not settled:
                     await self.limits.ledger.release(reserved)
+        return await with_retry(one_attempt, policy=self.policy, breaker=breaker)
 
-        return await with_retry(one_attempt, policy=self.policy, breaker=self.breaker)
+    async def _attempt_with_limits(self, text, idem_key):
+        try:
+            return await self._run_provider(self.provider, self.breaker, text, idem_key)
+        except (RetryExhaustedError, CircuitOpenError):
+            if self.fallback is None:
+                raise
+            return await self._run_provider(self.fallback, self.fallback_breaker, text, idem_key)
 
     # --- streaming --------------------------------------------------------
 
@@ -135,13 +146,28 @@ class TriageService:
         bytes go out. Once a StreamingResponse has started there is no status
         code left to change.
         """
-        async with self.limits.limiter():
-            await self._rate_slot()
-            upstream_failed = False
-            async for event in self.provider.stream(text):
-                if event.type == "error" and event.transient is not False:
-                    upstream_failed = True
-                yield event
+        reserved = await self.limits.ledger.reserve()
+        settled = False
+        try:
+            async with self.limits.limiter():
+                await self._rate_slot()
+                upstream_failed = False
+                async for event in self.provider.stream(text):
+                    if event.type == "error" and event.transient is not False:
+                        upstream_failed = True
+                    if (
+                        event.type == "done"
+                        and event.input_tokens is not None
+                        and event.output_tokens is not None
+                    ):
+                        await self.limits.ledger.settle(
+                            reserved, event.input_tokens, event.output_tokens
+                        )
+                        settled = True
+                    yield event
+        finally:
+            if not settled:
+                await self.limits.ledger.release(reserved)
         # A permanent error still counts as success here: upstream answered,
         # and it was the request that could not be served. Only a transient
         # error is evidence that upstream is sick.

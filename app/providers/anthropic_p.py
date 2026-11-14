@@ -236,4 +236,4 @@ class AnthropicProvider:
             # change on a retry -- refusal, max_tokens, invalid output.
             yield StreamEvent(type="error", error=str(exc), transient=False)
             return
-        yield StreamEvent(type="done", result=result)
+        yield StreamEvent(type="done", result=result, input_tokens=final.usage.input_tokens, output_tokens=final.usage.output_tokens)

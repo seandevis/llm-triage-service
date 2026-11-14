@@ -75,6 +75,7 @@ class Settings:
     # network. Pointed at api.anthropic.com the same code path talks to the
     # real API. Swapping the transport must never swap the client.
     provider: str = field(default_factory=lambda: _str("PROVIDER", "anthropic"))
+    fallback: str = field(default_factory=lambda: _str("FALLBACK_PROVIDER", ""))
     # Set-but-empty means "no base URL" -> the SDK's own default -> the real
     # API. Only an unset variable falls back to the mock, so clearing the value
     # does what the participant plainly meant rather than silently staying local.
