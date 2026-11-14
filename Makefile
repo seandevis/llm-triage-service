@@ -7,6 +7,11 @@ VENV    ?= .venv
 # Windows venvs put executables in Scripts/, POSIX ones in bin/.
 ifeq ($(OS),Windows_NT)
 VENV_BIN ?= $(VENV)/Scripts
+ifneq ($(wildcard C:/PROGRA~1/Git/usr/bin/sh.exe),)
+SHELL := C:/PROGRA~1/Git/usr/bin/sh.exe
+.SHELLFLAGS := -c
+export PATH := C:/PROGRA~1/Git/usr/bin;$(PATH)
+endif
 else
 VENV_BIN ?= $(VENV)/bin
 endif
