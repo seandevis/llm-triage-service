@@ -332,7 +332,7 @@ async def _reliability_layers_behave() -> bool:
     async def answer() -> TriageResult:
         nonlocal calls
         calls += 1
-        return TriageResult(severity="low", component="probe", steps=[], confidence=0.5)
+        return TriageResult(severity="low", component="unknown", steps=[], confidence=0.5)
 
     store = IdempotencyStore(fakeredis.aioredis.FakeRedis(decode_responses=True))
     key = make_key("probe", idem_key="probe")

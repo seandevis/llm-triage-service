@@ -1,53 +1,27 @@
-"""Idempotency with a result cache. STUB — stage 5.
+"""Idempotency with a result cache.
 
-Your job: make the same idempotency key return the same answer, without calling
-upstream twice.
+Caches the result, not merely the fact that a call happened -- which is the part
+most first attempts miss.
 
-The stubs below are PASS-THROUGH: they run, and do nothing useful. Stage 1
-drives requests through the whole service, so a stub that raised would block
-stage 1 on this one. Each `# stage 5:` comment says what replaces it.
+Ask a live model the same question twice at TEMPERATURE=0.7 and you get two
+different answers, both valid. A caller retrying a request whose response it
+never saw must get back the answer it already paid for, byte for byte. So the
+same key returns an identical object, the second call does not reach upstream at
+all, and two concurrent calls with one key produce one upstream call.
 
-The point of the exercise
--------------------------
+That last point is why this holds a per-key lock rather than doing a bare
+check-then-set: N simultaneous retries would otherwise all miss the empty cache
+together and all call upstream, which is the very case duplicates arrive in.
 
-Cache the result, not merely the fact that a call happened.
-
-Deduplicating the side effect is not enough here. Ask a live model the same
-question twice at `TEMPERATURE=0.7` and you get two different answers, both
-valid, both well-formed. A caller that retries a request whose response it never
-received -- the classic "did my POST land?" -- must get back *the answer it
-already paid for*, byte for byte, not a fresh sample from the model.
-
-So all three of these must hold:
-
-  * the same key returns the identical object, serialised identically
-  * the second call does not reach upstream at all -- not "reached it and
-    discarded the answer", not "reached it with a dedupe header". At all.
-  * two concurrent calls with the same key produce ONE upstream call, and both
-    callers receive the same stored result
-
-That last one is the one a bare check-then-set fails. N simultaneous retries all
-miss the empty cache at the same instant and all call upstream -- and this is
-the realistic case, because duplicate requests arrive together precisely when
-something upstream just retried. You need a per-key lock and a second check
-inside it.
-
-Storage
--------
-
-`build_redis()` is written for you and returns Redis or fakeredis depending on
-`USE_FAKEREDIS`. Store the serialised JSON, not the model object: an in-process
-dict would pass the single-process test and fail the moment there are two
-workers or a restart.
-
-Serialise once, on write. Every later read then returns exactly those bytes,
-which is what makes "byte-identical" true rather than merely "equal".
+Storage is Redis (fakeredis on the no-Docker path) holding serialised JSON. An
+in-process dict would pass the single-process test and fail in production.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from typing import Any, Awaitable, Callable
 
 from app.config import Settings, get_settings
@@ -67,52 +41,83 @@ def make_key(text: str, *, idem_key: str | None = None, salt: str = "") -> str:
     "these two requests are the same one", which is a stronger statement than
     identical bytes. Absent one, identical input text is the fallback identity.
     """
-    # stage 5: hash idem_key when given, else the request text; prefix with
-    # KEY_PREFIX. Include `salt` so a run at a different model or temperature
-    # does not serve the previous run's cached answers.
-    return KEY_PREFIX
+    if idem_key:
+        digest = hashlib.sha256(f"{salt}:{idem_key}".encode()).hexdigest()
+    else:
+        digest = hashlib.sha256(f"{salt}:body:{text}".encode()).hexdigest()
+    return f"{KEY_PREFIX}{digest}"
 
 
 class IdempotencyStore:
-    """Redis-backed store of completed results, keyed by idempotency key."""
 
     def __init__(self, redis: Any, *, ttl_s: int = DEFAULT_TTL_S) -> None:
         self.redis = redis
         self.ttl_s = ttl_s
+        # Per-key locks collapse concurrent duplicates into one upstream call.
+        # Process-local: within one worker this is exact. Across workers Redis
+        # SET NX would be the next step; the workshop stays single-worker.
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+
+    async def _lock_for(self, key: str) -> asyncio.Lock:
+        async with self._locks_guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            return lock
 
     async def get(self, key: str) -> TriageResult | None:
-        """The stored result for `key`, or None."""
-        # stage 5: read the key and validate it back into a TriageResult.
-        return None
+        raw = await self.redis.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        return TriageResult.model_validate_json(raw)
 
     async def put(self, key: str, result: TriageResult) -> None:
-        """Store `result` under `key` with a TTL."""
-        # stage 5: store result.model_dump_json() with an expiry of self.ttl_s.
-        # Serialise once, here -- that is what makes replays byte-identical.
+        """Store `result` under `key`.
+
+        Serialised once, here. Every later read returns exactly these bytes,
+        which is what makes "byte-identical" true rather than merely "equal".
+        """
+        await self.redis.set(key, result.model_dump_json(), ex=self.ttl_s)
 
     async def get_or_call(
         self, key: str, operation: Callable[[], Awaitable[TriageResult]]
     ) -> tuple[TriageResult, bool]:
         """Return the cached result for `key`, or run `operation` and cache it.
 
-        Returns `(result, cached)`. Callers need the flag: the spend ledger must
-        not charge twice for one upstream call, and the API reports it as a header.
+        Returns `(result, cached)` so callers can tell a served-from-cache
+        answer from a fresh one -- the spend ledger must not charge twice for
+        one upstream call, and the API surfaces it as a header.
+
+        The double-check inside the lock is deliberate: the first waiter runs
+        the operation, everyone behind it finds the result already there.
         """
-        # stage 5: on a hit return (result, True) without calling `operation`.
-        # On a miss, take a PER-KEY lock, check again inside it, then call
-        # `operation`, store the result and return (result, False). Without the
-        # lock, concurrent duplicates all miss the empty cache together and all
-        # hit upstream -- which is exactly when duplicates happen.
-        # test_idempotency.py fires 8 at once.
-        return await operation(), False
+        hit = await self.get(key)
+        if hit is not None:
+            return hit, True
+
+        lock = await self._lock_for(key)
+        async with lock:
+            hit = await self.get(key)
+            if hit is not None:
+                return hit, True
+            result = await operation()
+            await self.put(key, result)
+            return result, False
 
     async def clear(self) -> None:
-        """Drop every cached result. Tests only."""
-        # stage 5: delete every key under KEY_PREFIX.
+        """Tests only."""
+        keys = await self.redis.keys(f"{KEY_PREFIX}*")
+        if keys:
+            await self.redis.delete(*keys)
+        self._locks.clear()
 
 
 def build_redis(settings: Settings | None = None) -> Any:
-    """A Redis client, real or fake. GIVEN -- you do not need to change this.
+    """A Redis client, real or fake.
 
     `USE_FAKEREDIS=true` is the no-Docker path and the default: the tests must
     run with nothing installed but pip packages.

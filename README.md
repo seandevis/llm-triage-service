@@ -1,5 +1,8 @@
 # triage-service
 
+> **This is the `homework` branch.** All seven stages are done here; the tasks
+> are in [HOMEWORK.md](HOMEWORK.md). To build the stages yourself, use `main`.
+
 A small service that turns unstructured text — a bug report, a ticket, a
 failing test log — into a strict `TriageResult`. It is the workshop repository
 for a module on **LLM integration, structured outputs and service reliability**.

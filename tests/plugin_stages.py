@@ -94,10 +94,14 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         return
 
     by_stage: dict[int | None, list] = {}
+    homework: list = []
     for report in failed:
         # nodeid looks like tests/stages/test_retry.py::test_name
         filename = Path(report.nodeid.split("::")[0]).name
         parent = Path(report.nodeid.split("::")[0]).parent.name
+        if parent == "homework":
+            homework.append(report)
+            continue
         stage = STAGE_OF_FILE.get(filename) if parent == "stages" else None
         by_stage.setdefault(stage, []).append(report)
 
@@ -119,6 +123,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             files[Path(report.nodeid.split("::")[0]).name] = (
                 files.get(Path(report.nodeid.split("::")[0]).name, 0) + 1
             )
+        for name, count in sorted(files.items()):
+            writer.write_line(f"       {name}: {count}")
+
+    if homework:
+        writer.write_line("")
+        writer.write_line(f"  homework: {len(homework)} failing", bold=True, red=True)
+        writer.write_line("    -> HOMEWORK.md describes each task. Red here is the assignment.")
+        files = {}
+        for report in homework:
+            name = Path(report.nodeid.split("::")[0]).name
+            files[name] = files.get(name, 0) + 1
         for name, count in sorted(files.items()):
             writer.write_line(f"       {name}: {count}")
 

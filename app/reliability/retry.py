@@ -1,66 +1,25 @@
-"""Retry with backoff. STUB — stage 5.
+"""Retry with exponential backoff and jitter.
 
-Your job: retry transient failures, and be the ONLY layer that does.
+This is the only layer that retries. The anthropic SDK ships max_retries=2, so
+providers/anthropic_p.py builds its client with 0; leave both on and one request
+becomes up to (1 + MAX_RETRIES) x 3 upstream calls while MAX_RETRIES looks inert.
+/stats shows it plainly as calls and retries_observed, which is why test_retry.py
+asserts on the mock's call count rather than on whether the request succeeded.
 
-The stubs below are PASS-THROUGH: they run, and do nothing useful. Stage 1
-drives requests through the whole service, so a stub that raised would block
-stage 1 on this one. Each `# stage 5:` comment says what replaces it.
+Here rather than in the SDK because this layer can see the breaker, the ledger
+and the cache: it stops retrying when the breaker opens and does not re-charge a
+cached result. The SDK can see none of that, and the phase-two OpenAI adapter
+would otherwise need the same logic written twice.
 
-The trap
---------
-
-The `anthropic` SDK ships `max_retries=2`. If you write this module and
-leave that default alone, one logical request becomes up to
-`(1 + MAX_RETRIES) * (1 + 2)` upstream calls -- twelve at the shipped
-defaults -- while `MAX_RETRIES` appears to do nothing, because the SDK is
-quietly tripling whatever you set.
-
-The bug does not change the outcome. The request still succeeds; it just costs
-three times as much, takes three times as long, and hammers an upstream you were
-trying to be gentle with. That is why `test_retry.py` asserts on the mock's
-call count rather than on whether the call returned, and why the MAX_RETRIES=0
-case is the one that catches you. Run `make stats` and read `calls` and
-`retries_observed` -- the mock will show you the multiplication directly.
-
-Decide who retries, disable the other, and make `MAX_RETRIES` control whichever
-one is live. (The reference solution retries here and builds the SDK client with
-`max_retries=0`, because this layer can see the circuit breaker, the spend
-ledger and the idempotency cache, and the SDK can see none of them.)
-
-What to implement
------------------
-
-`RetryPolicy.delay_for(attempt, retry_after=None)` -- exponential backoff
-capped at `max_delay_s`. A server-supplied `Retry-After` should win over your
-own computation: the server is the only party that actually knows when it will
-accept traffic again. Cap it anyway, so a hostile header cannot wedge the
-request past the client timeout. Add jitter -- without it, N clients that failed
-together retry together and rebuild the thundering herd that caused the failure.
-
-`with_retry(operation, policy=..., breaker=...)` -- run `operation` until it
-succeeds or the budget runs out. `operation` must perform exactly one upstream
-attempt; if it retries internally you have two layers again and this function
-cannot tell.
-
-  * Only `TransientProviderError` is worth retrying. A `PermanentProviderError`
-    -- schema violation, refusal, 400 -- must propagate immediately: the same
-    call fails the same way, and four identical failures cost four times as much
-    to tell you the same thing.
-  * Ask the breaker before every attempt. `CircuitOpenError` means stop, not
-    try harder, so it must NOT be caught by your transient handler.
-  * Record success and failure on the breaker, but only for transient failures --
-    a malformed input says nothing about upstream health, and tripping on it
-    would let one bad request take the service down for everyone.
-  * When the budget is exhausted, raise `RetryExhaustedError` carrying the last
-    error.
-
-`max_retries` counts retries, so total attempts is `max_retries + 1`.
-`MAX_RETRIES=0` means one attempt and no retrying.
+Only TransientProviderError is retried. A schema violation or a refusal fails
+the same way four times over, costing four times as much to say so.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import random
 from dataclasses import dataclass
 from typing import Awaitable, Callable, TypeVar
 
@@ -75,7 +34,13 @@ MAX_DELAY_S = 2.0
 
 @dataclass
 class RetryPolicy:
-    """How many times to try, and how long to wait between attempts."""
+    """How many times to try, and how long to wait between attempts.
+
+    `max_retries` is the number of retries, so total attempts is
+    `max_retries + 1`. MAX_RETRIES=0 means one attempt and no retrying, which
+    is the setting `test_retry.py` uses to prove the SDK is not retrying
+    behind our back.
+    """
 
     max_retries: int = 3
     base_delay_s: float = BASE_DELAY_S
@@ -87,11 +52,21 @@ class RetryPolicy:
         return self.max_retries + 1
 
     def delay_for(self, attempt: int, retry_after: float | None = None) -> float:
-        """Backoff before retry number `attempt` (1-based)."""
-        # stage 5: exponential backoff capped at max_delay_s, with jitter. A
-        # server-supplied retry_after should win over your own computation (but
-        # still be capped).
-        return 0.0
+        """Backoff before retry number `attempt` (1-based).
+
+        A server-supplied `Retry-After` wins over our own backoff: it is the
+        one party that actually knows when it will accept traffic again. We cap
+        it so a hostile or buggy header cannot wedge the request past the
+        client timeout.
+        """
+        if retry_after is not None:
+            return max(0.0, min(retry_after, self.max_delay_s))
+        delay = min(self.base_delay_s * (2 ** (attempt - 1)), self.max_delay_s)
+        if self.jitter:
+            # Full jitter. Without it, N clients that failed together retry
+            # together and rebuild the thundering herd that caused the failure.
+            delay = random.uniform(0.0, delay)
+        return delay
 
 
 class RetryExhaustedError(RuntimeError):
@@ -110,12 +85,42 @@ async def with_retry(
     breaker: CircuitBreaker | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> T:
-    """Run `operation` until it succeeds, or until the retries run out."""
-    # stage 5: retry `operation` up to policy.max_attempts times. Retry only
-    # TransientProviderError; let PermanentProviderError propagate at once. Ask
-    # `breaker.before_call()` before each attempt and let CircuitOpenError
-    # through -- an open breaker means stop, not try harder. Raise
-    # RetryExhaustedError when the budget is spent. And make sure exactly ONE
-    # layer is retrying: the SDK client must be built with max_retries=0, or
-    # MAX_RETRIES will not mean what it says. Check `make stats`.
-    return await operation()
+    """Run `operation` until it succeeds, or until the retries run out.
+
+    `operation` must perform exactly one upstream attempt. If it retries
+    internally you have two layers again and this function cannot tell.
+    """
+    last_error: BaseException | None = None
+
+    for attempt in range(1, policy.max_attempts + 1):
+        if breaker is not None:
+            # Raises CircuitOpenError, which is deliberately NOT caught below:
+            # an open breaker means stop, not try harder.
+            await breaker.before_call()
+        try:
+            result = await operation()
+        except TransientProviderError as exc:
+            last_error = exc
+            if breaker is not None:
+                await breaker.record_failure()
+            if attempt >= policy.max_attempts:
+                break
+            await sleep(policy.delay_for(attempt, getattr(exc, "retry_after", None)))
+            continue
+        except CircuitOpenError:
+            raise
+        except Exception as exc:
+            # Permanent: do not retry, do not trip the breaker. Upstream is
+            # healthy; this particular request is not.
+            last_error = exc
+            raise
+        else:
+            if breaker is not None:
+                await breaker.record_success()
+            return result
+
+    raise RetryExhaustedError(
+        f"upstream still failing after {policy.max_attempts} attempt(s)",
+        attempts=policy.max_attempts,
+        last_error=last_error,
+    ) from last_error

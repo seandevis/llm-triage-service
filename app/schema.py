@@ -3,10 +3,14 @@ changing it changes the goalposts."""
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Literal, Protocol
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
+Components = Literal[
+    "auth", "payments", "database", "api", "ui", "search", "notifications", "storage", "unknown"
+]
+COMPONENTS = get_args(Components)
 Severity = Literal["trivial", "low", "medium", "high", "critical"]
 
 
@@ -17,7 +21,7 @@ class TriageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     severity: Severity
-    component: str
+    component: Components
     duplicate_of: str | None = None
     steps: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
@@ -36,6 +40,8 @@ class StreamEvent(BaseModel):
     type: Literal["start", "delta", "done", "error"]
     text: str | None = None
     result: TriageResult | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     error: str | None = None
     # On an `error` event: would the same request plausibly succeed later? A
     # truncated stream, a 429 or a stall is transient; a refusal, max_tokens or

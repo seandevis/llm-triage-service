@@ -14,14 +14,14 @@
 # The three unambiguous samples are the ones that must always be right; the
 # borderline and noisy ones are where the threshold lives.
 
-# TODO (stage 4): commit a threshold -- the fraction of the ten inputs that must
-# score as accepted. Set it by measuring, not by taste: `make golden` scores the
-# set on many seeds, `make golden MODE=bad_content` does the same for
-# confidently-wrong output. One seed is one sample of a spread; pick a bar the
-# worst clean seed clears and the best bad_content seed does NOT. If your
-# threshold passes under bad_content, it is measuring nothing. Committing it
-# here rather than in the test makes moving the bar a reviewable change.
-threshold: null
+# The committed bar. Set by measuring, not by taste (`make golden`). Over 40
+# seeds at TEMPERATURE=0.7 the reference solution scores 0.7-1.0 clean -- the
+# mock misreads hedged reports 04, 05 and 09 on some seeds -- and 0.0-0.5 under
+# FAULT_MODE=bad_content. 0.6 sits one case inside each edge. The gap is narrow,
+# and that is a finding, not a flaw: ten samples barely separate good from bad,
+# so a real deployment wants a bigger set before it trusts a bar. The earlier
+# 0.8 was set when every seed scored 10/10; it fails one seed in forty now.
+threshold: 0.6
 severity_tolerance: 1     # how many steps on the severity scale we forgive
 
 severity_scale: [trivial, low, medium, high, critical]

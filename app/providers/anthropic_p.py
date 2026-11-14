@@ -1,63 +1,30 @@
-"""The Anthropic adapter. STUB — stages 1 and 3.
+"""The Anthropic adapter: the real SDK, pointed wherever PROVIDER_BASE_URL says.
 
-Your job: drive the real `anthropic` SDK and satisfy `providers.base.Provider`.
-This is the only file in `app/` that may import `anthropic`; everything above
-it is written against the Protocol, which is what lets stage 7 add an OpenAI
-adapter without touching the reliability layers.
+The only file in app/ that imports anthropic. Everything above it is written
+against providers.base.Provider.
 
-Run `make test-fast` while you work, `make test` to check you are done.
-
-What the tests are asking for
------------------------------
-
-`extract_with_usage(text, idem_key=...)` -> `(TriageResult, input_tokens,
-output_tokens)`. One call in, exactly ONE upstream request out. The token
-counts feed the spend ledger, so they must be the real ones off the response.
-
-`extract(text, idem_key=...)` -> `TriageResult`. The same thing without the
-usage numbers.
-
-`stream(text)` -> async iterator of `StreamEvent`. Yield `start`, then a
-`delta` per text chunk, then exactly one terminal event: `done` carrying a
-validated result, or `error`. A stream that dies mid-object must yield
-`error`. Never `done` with a partial object -- half a TriageResult has the
-same shape as a whole one and the caller cannot tell.
-
-Four things that are easy to get wrong
---------------------------------------
-
-1. Build the client with `max_retries=0`. The SDK's default is 2. Leave it
-   alone and you have two retry layers multiplying: `(1 + MAX_RETRIES) x 3`
-   upstream calls for one request, with MAX_RETRIES appearing to do nothing.
-   `reliability/retry.py` owns retrying because only it can see the breaker,
-   the ledger and the cache. Watch `make stats` if you doubt it.
-
-2. Translate SDK exceptions at this boundary. The service layer decides what
-   to retry from `TransientProviderError` vs `PermanentProviderError` and
-   must never see an `anthropic.*` type. Transient: rate limit, timeout,
-   connection failure, 5xx, overload -- carry `retry_after` when the server
-   sent one. Permanent: 4xx, refusal, output that will not validate.
-
-3. `stop_reason` is not always `end_turn`. `max_tokens` means the
-   object is cut off mid-JSON; say so, rather than letting it surface as a
-   baffling JSON parse error. `refusal` means the model declined. Both are
-   permanent -- retrying produces the identical result at four times the cost.
-
-4. `temperature` is not in this SDK version's typed signature. `anthropic
-   ==1.1.0` dropped it from `messages.create()`, but the wire API still takes
-   it and the workshop turns it. Pass it through `extra_body` or `TEMPERATURE`
-   silently stops meaning anything.
-
-Ask the mock for the schema with `output_config`:
-
-    {"format": {"type": "json_schema", "schema": triage_result_json_schema()}}
+Two things here are load-bearing. The SDK's own retries are disabled
+(max_retries=0) because reliability/retry.py owns retrying -- see that module for
+the other half of the argument. And errors are translated at this boundary, so
+the service layer decides what to retry from TransientProviderError vs
+PermanentProviderError and never sees an anthropic.* type, which is the same
+decision it makes for the stage-7 OpenAI adapter.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, AsyncIterator
 
+import anthropic
+import httpx2
+import pydantic
+
 from app.config import Settings, get_settings
+from app.providers.base import (
+    PermanentProviderError,
+    TransientProviderError,
+)
 from app.schema import StreamEvent, TriageResult, triage_result_json_schema
 
 SYSTEM_PROMPT = (
@@ -69,49 +36,204 @@ SYSTEM_PROMPT = (
 )
 
 
+def _output_config() -> dict[str, Any]:
+    return {"format": {"type": "json_schema", "schema": triage_result_json_schema()}}
+
+
+def _sampling_body(settings: Settings) -> dict[str, Any]:
+    """Sampling parameters that are not in this SDK version's typed signature.
+
+    `anthropic==1.1.0` dropped `temperature` from the typed `create()`
+    params, but the wire API still takes it and the workshop turns it (the gate
+    runs at TEMPERATURE=0.7). `extra_body` is the SDK's supported route for
+    exactly this: the field lands in the request JSON, which is what the mock
+    fingerprints and what a real endpoint would honour. Keeping it here rather
+    than dropping it means TEMPERATURE in config still means something.
+    """
+    return {"temperature": settings.temperature}
+
+
+def _retry_after(exc: anthropic.APIStatusError) -> float | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _translate(exc: Exception) -> Exception:
+    """Map an SDK exception onto the adapter-neutral error vocabulary.
+
+    Transient = worth another attempt: rate limits, timeouts, connection
+    failures, 5xx, overload. Permanent = retrying cannot help: a malformed
+    request, an auth failure, a refusal, output that will not validate.
+    """
+    if isinstance(exc, anthropic.RateLimitError):
+        return TransientProviderError(f"rate limited: {exc}", retry_after=_retry_after(exc))
+    if isinstance(exc, (anthropic.APITimeoutError, anthropic.APIConnectionError)):
+        return TransientProviderError(f"transport failure: {exc}")
+    if isinstance(
+        exc,
+        (
+            anthropic.InternalServerError,
+            anthropic.ServiceUnavailableError,
+            anthropic.OverloadedError,
+            anthropic.DeadlineExceededError,
+        ),
+    ):
+        retry_after = _retry_after(exc) if isinstance(exc, anthropic.APIStatusError) else None
+        return TransientProviderError(f"upstream error: {exc}", retry_after=retry_after)
+    if isinstance(exc, anthropic.APIStatusError):
+        if exc.status_code >= 500:
+            return TransientProviderError(f"upstream {exc.status_code}: {exc}",
+                                          retry_after=_retry_after(exc))
+        return PermanentProviderError(f"upstream {exc.status_code}: {exc}")
+    if isinstance(exc, anthropic.AnthropicError):
+        return PermanentProviderError(f"provider error: {exc}")
+    if isinstance(exc, httpx2.TransportError):
+        # A connection that drops mid-stream surfaces raw from the transport;
+        # the SDK only wraps failures that happen before the response starts.
+        # A severed stream is the textbook transient failure.
+        return TransientProviderError(f"connection lost mid-response: {exc}")
+    return exc
+
+
+def _parse(text: str) -> TriageResult:
+    """Validate provider text into a TriageResult, or fail permanently.
+
+    A schema violation is not retryable at this layer: the same prompt at the
+    same temperature will not reliably produce different structure, and the
+    caller needs a clear error rather than four identical failures.
+    """
+    try:
+        return TriageResult.model_validate_json(text)
+    except pydantic.ValidationError as exc:
+        raise PermanentProviderError(f"provider output did not match schema: {exc}") from exc
+    except json.JSONDecodeError as exc:  # pragma: no cover - pydantic handles most of these
+        raise PermanentProviderError(f"provider output was not JSON: {exc}") from exc
+
+
+def _text_of(message: anthropic.types.Message) -> str:
+    """Concatenate the text blocks of a Message.
+
+    `stop_reason == "max_tokens"` means the object is cut off mid-JSON. That
+    is a real failure with a real cause (MAX_TOKENS too low), so it gets its own
+    message rather than surfacing as a baffling JSON parse error.
+    """
+    if message.stop_reason == "max_tokens":
+        raise PermanentProviderError(
+            "provider hit max_tokens before finishing the object; raise MAX_TOKENS"
+        )
+    if message.stop_reason == "refusal":
+        raise PermanentProviderError("provider refused to answer this input")
+    parts = [block.text for block in message.content if getattr(block, "type", None) == "text"]
+    if not parts:
+        raise PermanentProviderError(
+            f"provider returned no text content (stop_reason={message.stop_reason})"
+        )
+    return "".join(parts)
+
+
 class AnthropicProvider:
     """`Provider` implementation driving the real `anthropic` SDK.
 
     Holds no reliability logic of its own beyond error translation: one call in,
     one upstream request out. Retry, idempotency, concurrency and spend live in
-    `app/reliability/` so every future adapter shares them.
+    `app/reliability/` so they are shared by every future adapter.
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        raise NotImplementedError(
-            "stage 1: build an anthropic.AsyncAnthropic client here. Use "
-            "settings.provider_base_url as base_url, settings.request_timeout_s "
-            "as timeout, and max_retries=0 -- reliability/retry.py owns retrying, "
-            "and leaving the SDK's default of 2 on gives you both."
-        )
+        kwargs: dict[str, Any] = {
+            "api_key": self.settings.api_key,
+            # See the module docstring: our retry layer owns retrying. If you
+            # ever raise this above 0, MAX_RETRIES stops meaning what it says
+            # and /stats will show you the damage.
+            "max_retries": 0,
+            "timeout": self.settings.request_timeout_s,
+        }
+        if self.settings.provider_base_url:
+            kwargs["base_url"] = self.settings.provider_base_url
+        self.client = anthropic.AsyncAnthropic(**kwargs)
 
     async def aclose(self) -> None:
-        raise NotImplementedError("stage 1: close the underlying SDK client")
+        await self.client.close()
+
+    # --- unary ------------------------------------------------------------
+
+    async def _create(self, text: str, idem_key: str | None) -> anthropic.types.Message:
+        """One upstream call, errors translated. The single place we call the SDK."""
+        extra_headers = {"idempotency-key": idem_key} if idem_key else None
+        try:
+            return await self.client.messages.create(
+                model=self.settings.model,
+                max_tokens=self.settings.max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": text}],
+                output_config=_output_config(),
+                extra_headers=extra_headers,
+                extra_body=_sampling_body(self.settings),
+            )
+        except Exception as exc:
+            raise _translate(exc) from exc
 
     async def extract(self, text: str, *, idem_key: str | None = None) -> TriageResult:
-        raise NotImplementedError(
-            "stage 1: one upstream call returning a validated TriageResult. No "
-            "retrying and no caching here -- those live above you."
-        )
+        """One upstream call. No retrying, no caching -- those live above."""
+        result, _, _ = await self.extract_with_usage(text, idem_key=idem_key)
+        return result
 
     async def extract_with_usage(
         self, text: str, *, idem_key: str | None = None
     ) -> tuple[TriageResult, int, int]:
-        raise NotImplementedError(
-            "stage 1: like extract(), but also return (input_tokens, output_tokens) "
-            "from the response's usage block so the spend ledger can charge the call."
-        )
+        """`extract` plus the token counts, so the spend ledger can charge it."""
+        message = await self._create(text, idem_key)
+        result = _parse(_text_of(message))
+        return result, message.usage.input_tokens, message.usage.output_tokens
+
+    # --- streaming --------------------------------------------------------
 
     async def stream(self, text: str) -> AsyncIterator[StreamEvent]:
-        raise NotImplementedError(
-            "stage 3: yield StreamEvent(type='start'), then 'delta' per chunk, then "
-            "exactly one of 'done' (with a validated result) or 'error'. A truncated "
-            "stream must end in 'error' -- never a partial object dressed as an answer. "
-            "Set `transient` on the error: True if the same request could succeed "
-            "later (truncation, 429, stall), False if it never will (refusal, "
-            "max_tokens, invalid output). The breaker counts only transient ones. "
-            "Note: a stream cut off mid-response raises httpx2.RemoteProtocolError "
-            "(both SDKs sit on httpx2, not httpx), and the SDK does not wrap it."
-        )
-        yield  # pragma: no cover - makes this an async generator
+        """Yield StreamEvents as the object is produced.
+
+        A stream that dies mid-object yields an `error` event and never a
+        `done`: a half-parsed TriageResult is worse than no result, because
+        it looks like an answer.
+        """
+        yield StreamEvent(type="start")
+        buffer: list[str] = []
+        try:
+            async with self.client.messages.stream(
+                model=self.settings.model,
+                max_tokens=self.settings.max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": text}],
+                output_config=_output_config(),
+                extra_body=_sampling_body(self.settings),
+            ) as stream:
+                async for event in stream:
+                    if event.type == "text":
+                        buffer.append(event.text)
+                        yield StreamEvent(type="delta", text=event.text)
+                final = await stream.get_final_message()
+        except Exception as exc:
+            translated = _translate(exc)
+            yield StreamEvent(
+                type="error",
+                error=str(translated),
+                transient=isinstance(translated, TransientProviderError),
+            )
+            return
+
+        try:
+            result = _parse(_text_of(final))
+        except Exception as exc:
+            # The stream completed; what came back cannot be used and would not
+            # change on a retry -- refusal, max_tokens, invalid output.
+            yield StreamEvent(type="error", error=str(exc), transient=False)
+            return
+        yield StreamEvent(type="done", result=result, input_tokens=final.usage.input_tokens, output_tokens=final.usage.output_tokens)

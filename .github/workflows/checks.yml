@@ -1,0 +1,35 @@
+name: checks
+
+# Runs on every pull request into `homework`. Two jobs so a PR shows separately
+# whether the existing service still works and how far the homework got.
+on:
+  pull_request:
+    branches: [homework]
+  push:
+    branches: [homework]
+
+jobs:
+  service:
+    name: service still green
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make venv
+      - run: FAULT_RATE=0.4 TEMPERATURE=0.7 .venv/bin/pytest --ignore=tests/homework
+      - run: MOCK_ALLOW_HEADER_OVERRIDE=false FAULT_RATE=0.4 TEMPERATURE=0.7 .venv/bin/pytest --ignore=tests/homework
+
+  homework:
+    name: homework tasks
+    # Red on the branch itself by design, so only on pull requests.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make venv
+      - run: make homework
