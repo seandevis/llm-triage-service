@@ -11,15 +11,32 @@ so the provider has to report its token usage somehow.
 
 from __future__ import annotations
 
+from typing import AsyncIterator
+
 import pytest
 
 from app.reliability.limits import SpendCeilingExceeded
+from app.schema import StreamEvent, TriageResult
 
 TEXT = "Checkout fails with a 500 for every card payment since the 4.2 deploy."
 
 
 async def _drain(service, text: str = TEXT) -> list:
     return [event async for event in service.triage_stream(text)]
+
+
+class NoUsageProvider:
+    """Finishes a stream with a valid object but no token counts."""
+
+    async def stream(self, text: str) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(type="start")
+        yield StreamEvent(
+            type="done",
+            result=TriageResult(severity="low", component="ui", confidence=0.5),
+        )
+
+    async def aclose(self) -> None:
+        return None
 
 
 async def test_a_stream_is_charged(make_service, mock_server, env):
@@ -72,3 +89,55 @@ async def test_streams_and_calls_share_one_budget(make_service, env):
     await _drain(service)
 
     assert service.limits.ledger.spent_usd > after_call > 0
+
+
+async def test_an_openai_stream_is_charged(make_service, mock_server, env):
+    """The OpenAI dialect only reports stream usage when asked to, so check it too."""
+    env(PROVIDER="openai", FAULT_RATE="0.0", TEMPERATURE="0.7", SPEND_CEILING_USD="1.0")
+    service = make_service()
+    mock_server.reset_stats()
+
+    events = await _drain(service)
+
+    assert events[-1].type == "done", [e.type for e in events]
+    spent = service.limits.ledger.spent_usd
+    billed = mock_server.stats()["estimated_cost_usd"]
+    assert spent > 0, "the OpenAI stream cost money, and the ledger did not record it"
+    assert spent == pytest.approx(billed, abs=1e-6), (
+        f"the ledger says ${spent:.6f}, the provider billed ${billed:.6f}"
+    )
+
+
+async def test_a_stream_without_usage_is_charged_the_worst_case(make_service, env):
+    """No token counts on `done` must not mean free: charge what was reserved."""
+    env(FAULT_RATE="0.0", TEMPERATURE="0.7", SPEND_CEILING_USD="1.0")
+    service = make_service(provider=NoUsageProvider())
+
+    events = await _drain(service)
+
+    assert events[-1].type == "done"
+    ledger = service.limits.ledger
+    assert ledger.spent_usd == pytest.approx(ledger.worst_case_usd(), abs=1e-9)
+    assert ledger.committed_usd == pytest.approx(ledger.spent_usd, abs=1e-9), (
+        "the reservation is still held after the stream was settled"
+    )
+
+
+async def test_an_abandoned_stream_gives_its_reservation_back(make_service, env):
+    """A client that disconnects mid-stream must not leave budget or a permit held."""
+    env(FAULT_RATE="0.0", TEMPERATURE="0.7", SPEND_CEILING_USD="1.0")
+    service = make_service()
+
+    stream = service.triage_stream(TEXT)
+    async for event in stream:
+        if event.type == "delta":
+            break
+    else:
+        pytest.fail("the stream ended before its first delta")
+    await stream.aclose()
+
+    ledger = service.limits.ledger
+    assert ledger.committed_usd == pytest.approx(ledger.spent_usd, abs=1e-9), (
+        "a reservation is still held after the client walked away"
+    )
+    assert service.limits.limiter.in_flight == 0, "the concurrency permit was not returned"

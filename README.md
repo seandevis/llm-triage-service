@@ -383,11 +383,13 @@ Things the repo does not do, on purpose or not yet. They are listed so nobody
 mistakes them for something they broke, and each makes a good paragraph in
 `REPORT.md`.
 
-- **Streams bypass the spend ceiling.** `triage_stream` takes a permit and a
-  rate slot but never reserves or settles against the `SpendLedger`, so
-  `/triage/stream` can spend without limit, and no test notices. Closing it
-  needs the stream to report the tokens it used, which `Provider.stream` and
-  `StreamEvent` do not carry today: a contract change, not a one-line fix.
+- **A refused stream is not a 402.** Streams are charged against the
+  `SpendLedger` like unary calls, and the reservation happens before anything
+  reaches the provider. But `triage_stream` reserves on its first iteration,
+  after the route has already returned a `StreamingResponse`, so a stream over
+  the ceiling arrives as `200` with an SSE `error` event where `/triage` would
+  answer `402`. Fixing it means reserving in the route, before the response
+  starts, the way the breaker check already does.
 - **Divergence 5 is not tested.** The mock answers both `/v1/chat/completions`
   and `/chat/completions`, so an OpenAI adapter that gets the `/v1` wrong still
   passes every test. Against the real API it would fail with a bare 404.

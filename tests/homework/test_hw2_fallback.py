@@ -139,3 +139,17 @@ def test_the_fallback_is_chosen_by_a_setting(env):
 
     env(FALLBACK_PROVIDER="")
     assert TriageService(settings=config_module.get_settings()).fallback is None
+
+
+def test_a_fallback_on_the_same_dialect_is_refused_at_startup(env):
+    """The same vendor goes down in the same outage; that is no fallback at all."""
+    env(PROVIDER="anthropic", FALLBACK_PROVIDER="anthropic")
+    with pytest.raises(RuntimeError, match="same dialect"):
+        TriageService(settings=config_module.get_settings())
+
+
+def test_an_unknown_fallback_is_refused_at_startup(env):
+    """A typo must fail at boot, not look like "no fallback" until the first outage."""
+    env(FALLBACK_PROVIDER="opneai")
+    with pytest.raises(RuntimeError, match="FALLBACK_PROVIDER 'opneai'"):
+        TriageService(settings=config_module.get_settings())

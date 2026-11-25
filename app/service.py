@@ -75,11 +75,23 @@ class TriageService:
         if primary is None:
             raise RuntimeError(f"no provider adapter for dialect {self.settings.provider!r}")
         self.provider: Provider = primary
-        self.fallback = fallback or build_provider(self.settings, self.settings.fallback)
+        fallback_name = self.settings.fallback
+        if fallback_name == self.settings.provider:
+            raise RuntimeError(
+                f"FALLBACK_PROVIDER is the same dialect as PROVIDER ({fallback_name!r}); "
+                "a fallback on the same vendor goes down in the same outage"
+            )
+        if fallback is None and fallback_name:
+            fallback = build_provider(self.settings, fallback_name)
+            if fallback is None:
+                raise RuntimeError(f"no provider adapter for FALLBACK_PROVIDER {fallback_name!r}")
+        self.fallback = fallback
         self.store = store or IdempotencyStore(build_redis(self.settings))
         self.limits = limits or Limits.from_settings(self.settings)
-        self.breaker = breaker or CircuitBreaker(name="anthropic")
-        self.fallback_breaker = CircuitBreaker(name="openai") if self.fallback else None
+        self.breaker = breaker or CircuitBreaker(name=self.settings.provider)
+        self.fallback_breaker = (
+            CircuitBreaker(name=self.settings.fallback or "fallback") if self.fallback else None
+        )
         self.policy = RetryPolicy(max_retries=self.settings.max_retries)
         # Salts the cache key with the settings that change the answer, so a
         # run at a different temperature or model does not serve the previous
@@ -137,9 +149,9 @@ class TriageService:
         different answer mid-response. A truncated stream surfaces as an
         `error` event, which is what `test_stream.py` asserts.
 
-        Not charged against the spend ceiling: the stream does not report its
-        token usage, so there is nothing to reserve or settle. A known gap, not
-        an oversight -- README's "Known gaps" says what closing it would take.
+        Charged against the spend ceiling like a unary call. A stream that ends
+        in `done` without token counts is settled at the worst-case reservation;
+        one that ends in an error releases it.
 
         The caller is expected to have run `breaker.before_call()` already --
         the route does, so it can answer 503 with a real status code before any
@@ -155,14 +167,13 @@ class TriageService:
                 async for event in self.provider.stream(text):
                     if event.type == "error" and event.transient is not False:
                         upstream_failed = True
-                    if (
-                        event.type == "done"
-                        and event.input_tokens is not None
-                        and event.output_tokens is not None
-                    ):
-                        await self.limits.ledger.settle(
-                            reserved, event.input_tokens, event.output_tokens
-                        )
+                    if event.type == "done":
+                        ledger = self.limits.ledger
+                        if event.input_tokens is not None and event.output_tokens is not None:
+                            in_tok, out_tok = event.input_tokens, event.output_tokens
+                        else:
+                            in_tok, out_tok = ledger.estimated_input_tokens, ledger.max_tokens
+                        await ledger.settle(reserved, in_tok, out_tok)
                         settled = True
                     yield event
         finally:
